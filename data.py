@@ -1,21 +1,20 @@
 import pytorch_lightning as pl
 import torch
 import pandas as pd
-import multiprocessing as mp
 import youtokentome as yttm
 import sacremoses as sm
 
 
 class Dataset(pl.LightningDataModule):
     def __init__(self,
-                 train_path='data/train.pkl.zip',
-                 val_path='data/val.pkl.zip',
-                 test_path='data/test.pkl.zip',
+                 train_path='data/wmt14.en-de/train.pkl.zip',
+                 val_path='data/wmt14.en-de/val.pkl.zip',
+                 test_path='data/wmt14.en-de/test.pkl.zip',
                  slang='de',
                  tlang='en',
                  is_moses=True,
-                 sbpe='data/bpe.32k.de',
-                 tbpe='data/bpe.32k.en',
+                 sbpe='data/wmt14.en-de/bpe.32k.de',
+                 tbpe='data/wmt14.en-de/bpe.32k.en',
                  batch_size=4096):
         super().__init__()
 
@@ -31,6 +30,7 @@ class Dataset(pl.LightningDataModule):
         self.tbpe = tbpe
 
     def setup(self, stage=None):
+        pl._logger.info('setup dataset ...')
         self.train_df = pd.read_pickle(self.train_path).sample(frac=1)
         self.val_df = pd.read_pickle(self.val_path).sample(frac=1)[:300]
         self.test_df = pd.read_pickle(self.test_path).sample(frac=1)
@@ -50,11 +50,12 @@ class Dataset(pl.LightningDataModule):
         batch_tlen = []
         mlen = 0
         for i, (sl, tl) in enumerate(zip(slen, tlen)):
-            assert sl + tl <= size
+            assert sl <= size and tl <= size
             batch_slen.append(sl)
             batch_tlen.append(tl)
             batch_id.append(i)
-            if len(batch_id) * (max(batch_slen) + max(batch_tlen)) > size:
+            if len(batch_id) * max(batch_slen) > size or len(batch_id) * max(
+                    batch_tlen) > size:
                 batch_ids.append(batch_id[:-1])
                 batch_slen = batch_slen[-1:]
                 batch_tlen = batch_tlen[-1:]
@@ -83,7 +84,7 @@ class Dataset(pl.LightningDataModule):
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
-            num_workers=mp.cpu_count(),
+            num_workers=8,
             collate_fn=self.collate_fn,
         )
         return dataloader
@@ -94,7 +95,7 @@ class Dataset(pl.LightningDataModule):
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
-            num_workers=mp.cpu_count(),
+            num_workers=8,
             collate_fn=self.collate_fn,
         )
         return dataloader
@@ -105,7 +106,7 @@ class Dataset(pl.LightningDataModule):
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
-            num_workers=mp.cpu_count(),
+            num_workers=8,
             collate_fn=self.collate_fn,
         )
         return dataloader

@@ -31,7 +31,9 @@ class MT(pl.LightningModule):
         parser.add_argument('--trg_vocab_size', type=int, default=32000)
         parser.add_argument('--dim', type=int, default=512)
         parser.add_argument('--dropout', type=float, default=0.1)
-        parser.add_argument('--lr_scale', type=float, default=1)
+        parser.add_argument('--lr_scale_according_to_batch_size',
+                            action='store_true',
+                            default=False)
         parser.add_argument('--warmup', type=int, default=4000)
         parser.add_argument('--slang', type=str, default='de')
         parser.add_argument('--tlang', type=str, default='en')
@@ -83,9 +85,10 @@ class MT(pl.LightningModule):
         result = pl.TrainResult(loss)
         result.log('train/loss', loss)
         mask = Y_true.ne(0)
-        acc = ACC(Y_hyp.masked_select(mask), Y_true.masked_select(mask))
-        result.log('train/acc', acc, prog_bar=True)
         result.log('train/lr', self.lr, prog_bar=True)
+        if batch_idx % 100 == 0:
+            acc = ACC(Y_hyp.masked_select(mask), Y_true.masked_select(mask))
+            result.log('train/acc', acc, prog_bar=True)
 
         if batch_idx % 1000 == 0:
             src_ids2strs = self.trainer.datamodule.src_ids2strs
@@ -135,7 +138,9 @@ class MT(pl.LightningModule):
         dim = h.dim
         step = self.trainer.global_step + 1
         self.lr = dim**(-0.5) * min(step**(-0.5), step * h.warmup**(-1.5))
-        self.lr = self.lr * self.trainer.num_gpus * h.lr_scale
+        self.lr = self.lr
+        if h.lr_scale_according_to_batch_size:
+            self.lr = self.lr * (h.batch_size / 25000)
         # self.lr = 1e-4
         for pg in optimizer.param_groups:
             pg['lr'] = self.lr
