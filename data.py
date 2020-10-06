@@ -5,13 +5,24 @@ import youtokentome as yttm
 import sacremoses as sm
 
 
+class Vocab:
+    def __init__(self) -> None:
+        self.specials = ['<pad>', '<unk>', '<bos>', '<eos>']
+
+    def read_text(self, fname):
+        pass
+
+    def read_vocab(self, fname):
+        pass
+
+
 class Dataset(pl.LightningDataModule):
     def __init__(self,
                  train_path='data/wmt14.en-de/train.pkl.zip',
                  val_path='data/wmt14.en-de/val.pkl.zip',
                  test_path='data/wmt14.en-de/test.pkl.zip',
-                 slang='de',
-                 tlang='en',
+                 slang='en',
+                 tlang='de',
                  is_moses=True,
                  sbpe='data/wmt14.en-de/bpe.32k.de',
                  tbpe='data/wmt14.en-de/bpe.32k.en',
