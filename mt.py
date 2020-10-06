@@ -18,7 +18,12 @@ class MT(pl.LightningModule):
 
         h = self.hparams = hparams
         self.src_emb = Embedding(h.src_vocab_size, h.dim, dropout=h.dropout)
-        self.trg_emb = Embedding(h.trg_vocab_size, h.dim, dropout=h.dropout)
+        if h.share_vocab:
+            self.trg_emb = self.src_emb
+        else:
+            self.trg_emb = Embedding(h.trg_vocab_size,
+                                     h.dim,
+                                     dropout=h.dropout)
         self.tf = nn.Transformer(dropout=h.dropout)
         self.proj = nn.Linear(h.dim, h.trg_vocab_size)
         self.proj.weight = self.trg_emb.emb.weight
@@ -29,19 +34,18 @@ class MT(pl.LightningModule):
         parser = ap.ArgumentParser(parents=[parent_parser], add_help=False)
         parser.add_argument('--src_vocab_size', type=int, default=32000)
         parser.add_argument('--trg_vocab_size', type=int, default=32000)
-        parser.add_argument('--dim', type=int, default=512)
-        parser.add_argument('--dropout', type=float, default=0.1)
-        parser.add_argument('--lr_scale_according_to_batch_size',
+        parser.add_argument('--share_vocab',
                             action='store_true',
                             default=False)
+        parser.add_argument('--dim', type=int, default=512)
+        parser.add_argument('--dropout', type=float, default=0.1)
+        parser.add_argument('--lr_scale', type=float, default=1)
         parser.add_argument('--warmup', type=int, default=4000)
-        parser.add_argument('--slang', type=str, default='de')
-        parser.add_argument('--tlang', type=str, default='en')
         parser.add_argument(
             '--loss',
             type=str,
             default='ce',
-            choices=['ce', 'label_smooth', 'fairseq_label_smooth'])
+            choices=['ce', 'label_smooth', 'label_smoothed_nll_loss'])
         return parser
 
     def mask(self, x):
@@ -117,11 +121,36 @@ class MT(pl.LightningModule):
         loss = loss.masked_select(mask).sum() / (mask.sum())
         return loss
 
+    def label_smoothed_nll_loss(self, output, target):
+        lprobs = output.log_softmax(-1)
+        epsilon = 0.1
+        ignore_index = 0
+        reduce = True
+        if target.dim() == lprobs.dim() - 1:
+            target = target.unsqueeze(-1)
+        nll_loss = -lprobs.gather(dim=-1, index=target)
+        smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
+        if ignore_index is not None:
+            pad_mask = target.eq(ignore_index)
+            nll_loss.masked_fill_(pad_mask, 0.)
+            smooth_loss.masked_fill_(pad_mask, 0.)
+        else:
+            nll_loss = nll_loss.squeeze(-1)
+            smooth_loss = smooth_loss.squeeze(-1)
+        if reduce:
+            nll_loss = nll_loss.mean()
+            smooth_loss = smooth_loss.mean()
+        eps_i = epsilon / lprobs.size(-1)
+        loss = (1. - epsilon) * nll_loss + eps_i * smooth_loss
+        return loss
+
     def loss(self, output, target):
         if self.hparams.loss == 'ce':
             loss = self.ce_loss(output, target)
         if self.hparams.loss == 'label_smooth':
             loss = self.label_smooth_loss(output, target)
+        if self.hparams.loss == 'label_smoothed_nll_loss':
+            loss = self.label_smoothed_nll_loss(output, target)
         return loss
 
     def configure_optimizers(self):
@@ -138,10 +167,7 @@ class MT(pl.LightningModule):
         dim = h.dim
         step = self.trainer.global_step + 1
         self.lr = dim**(-0.5) * min(step**(-0.5), step * h.warmup**(-1.5))
-        self.lr = self.lr
-        if h.lr_scale_according_to_batch_size:
-            self.lr = self.lr * (h.batch_size / 25000)
-        # self.lr = 1e-4
+        self.lr = self.lr * h.lr_scale
         for pg in optimizer.param_groups:
             pg['lr'] = self.lr
 
@@ -195,10 +221,36 @@ if __name__ == "__main__":
     parser = ap.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
     parser = MT.add_model_specific_args(parser)
+    parser.add_argument('--train_path',
+                        type=str,
+                        default='data/wmt14.en-de/train.pkl.zip')
+    parser.add_argument('--val_path',
+                        type=str,
+                        default='data/wmt14.en-de/val.pkl.zip')
+    parser.add_argument('--test_path',
+                        type=str,
+                        default='data/wmt14.en-de/test.pkl.zip')
+    parser.add_argument('--slang', type=str, default='de')
+    parser.add_argument('--tlang', type=str, default='en')
+    parser.add_argument('--is_moses', action='store_true', default=True)
+    parser.add_argument('--sbpe',
+                        type=str,
+                        default='data/wmt14.en-de/bpe.32k.de')
+    parser.add_argument('--tbpe',
+                        type=str,
+                        default='data/wmt14.en-de/bpe.32k.en')
     parser.add_argument('--batch_size', type=int, default=4096)
     hparams = parser.parse_args()
 
-    dataset = Dataset(batch_size=hparams.batch_size)
+    dataset = Dataset(train_path=hparams.train_path,
+                      val_path=hparams.val_path,
+                      test_path=hparams.test_path,
+                      slang=hparams.slang,
+                      tlang=hparams.tlang,
+                      is_moses=hparams.is_moses,
+                      sbpe=hparams.sbpe,
+                      tbpe=hparams.tbpe,
+                      batch_size=hparams.batch_size)
     mt = MT(hparams)
     pl._logger.info(mt)
     trainer = pl.Trainer.from_argparse_args(

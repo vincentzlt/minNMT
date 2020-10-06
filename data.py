@@ -32,7 +32,7 @@ class Dataset(pl.LightningDataModule):
     def setup(self, stage=None):
         pl._logger.info('setup dataset ...')
         self.train_df = pd.read_pickle(self.train_path).sample(frac=1)
-        self.val_df = pd.read_pickle(self.val_path).sample(frac=1)[:300]
+        self.val_df = pd.read_pickle(self.val_path).sample(frac=1)
         self.test_df = pd.read_pickle(self.test_path).sample(frac=1)
 
         self.sbpe_model = yttm.BPE(self.sbpe)
