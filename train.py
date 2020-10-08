@@ -1,13 +1,13 @@
 import pytorch_lightning as pl
-from pytorch_lightning import trainer
 import torch
 from torch import nn
 import torch.nn.functional as F
 import argparse as ap
 import os
 
-from data import Dataset
-from tf import Transformer, Embedding
+import data
+import model
+import search
 import sacrebleu as sb
 ACC = pl.metrics.Accuracy()
 
@@ -17,26 +17,25 @@ class MT(pl.LightningModule):
         super().__init__()
 
         h = self.hparams = hparams
-        self.src_emb = Embedding(h.src_vocab_size, h.dim, dropout=h.dropout)
-        if h.share_vocab:
-            self.trg_emb = self.src_emb
+        if h.model='my_transformer':
+            self.model=model.MyTransformer(h.dim, h.vocab_size, h.dropout)
+        elif h.model='my_transformer':
+            self.model=model.PytorchTransformer(h.dim, h.vocab_size, h.dropout)
         else:
-            self.trg_emb = Embedding(h.trg_vocab_size,
-                                     h.dim,
-                                     dropout=h.dropout)
-        self.tf = nn.Transformer(dropout=h.dropout)
-        self.proj = nn.Linear(h.dim, h.trg_vocab_size)
-        self.proj.weight = self.trg_emb.emb.weight
+            raise ValueError('model not defined.')
+
+        self.search=search.Search(self.model)
         self.lr = 0
 
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = ap.ArgumentParser(parents=[parent_parser], add_help=False)
-        parser.add_argument('--src_vocab_size', type=int, default=32000)
-        parser.add_argument('--trg_vocab_size', type=int, default=32000)
-        parser.add_argument('--share_vocab',
-                            action='store_true',
-                            default=False)
+        parser.add_argument(
+            '--model',
+            type=str,
+            default='my_transformer',
+            choices=['my_transformer', 'pytorch_transformer'])
+        parser.add_argument('--vocab_size', type=int, default=32000)
         parser.add_argument('--dim', type=int, default=512)
         parser.add_argument('--dropout', type=float, default=0.1)
         parser.add_argument('--lr_scale', type=float, default=1)
@@ -48,61 +47,35 @@ class MT(pl.LightningModule):
             choices=['ce', 'label_smooth', 'label_smoothed_nll_loss'])
         return parser
 
-    def mask(self, x):
-        mask = self.tf.generate_square_subsequent_mask(x.size(0)).type_as(x)
-        return mask
-
-    def forward(self, X, Y):
-        X = self.src_emb(X)
-        Y = self.trg_emb(Y)
-        Y = self.tf(X, Y, tgt_mask=self.mask(Y))
-        Y = self.proj(Y)
-        return Y
-
-    def forward_step(self, X):
-        BOS = X[:1]
-        Y = BOS[:0]
-        finished = torch.zeros_like(BOS).view(-1).bool()
-
-        X = self.src_emb(X)
-        X = self.tf.encoder(X)
-        for i in range(int(X.size(0) * 1.1)):
-            Y = torch.cat([BOS, Y])
-            Y = self.trg_emb(Y)
-            Y = self.tf.decoder(Y, X, tgt_mask=self.mask(Y))
-            Y = self.proj(Y)
-            Y = Y.max(-1)[1]
-            finished = finished + Y[-1:].view(-1).eq(3)
-            if finished.all():
-                break
-        return Y
+    def forward(self, x, y):
+        return self.model(x, y)
 
     def training_step(self, batch, batch_idx):
         h = self.hparams
-        X = batch[h.slang]
-        Y = batch[h.tlang][:-1]
-        Y_true = batch[h.tlang][1:]
+        x = batch[h.slang]
+        y = batch[h.tlang][:-1]
+        y_true = batch[h.tlang][1:]
 
-        Y = self(X, Y)
-        Y_hyp = Y.max(-1)[1]
-        loss = self.loss(Y, Y_true)
+        y = self(x,y)
+        loss = self.loss(y, y_true)
         result = pl.TrainResult(loss)
         result.log('train/loss', loss)
-        mask = Y_true.ne(0)
         result.log('train/lr', self.lr, prog_bar=True)
         if batch_idx % 100 == 0:
-            acc = ACC(Y_hyp.masked_select(mask), Y_true.masked_select(mask))
+            mask=y_true.ne(0)
+            y_hyp=y.max(-1)[1]
+            acc = ACC(y_hyp.masked_select(mask), y_true.masked_select(mask))
             result.log('train/acc', acc, prog_bar=True)
 
-        if batch_idx % 1000 == 0:
-            src_ids2strs = self.trainer.datamodule.src_ids2strs
-            src_str = src_ids2strs(X.T.tolist()[:1])
-            trg_ids2strs = self.trainer.datamodule.trg_ids2strs
-            trg_str = trg_ids2strs(Y_true.T.tolist()[:1])
-            hyp_str = trg_ids2strs(Y_hyp.T.tolist()[:1])
-            pl._logger.info(f'src: {src_str[0]}')
-            pl._logger.info(f'trg: {trg_str[0]}')
-            pl._logger.info(f'hyp: {hyp_str[0]}')
+            if batch_idx % 1000 == 0:
+                src_ids2str = self.trainer.datamodule.src_vocab.ids2str
+                src_str = src_ids2str(x.T.tolist()[0])
+                trg_ids2str = self.trainer.datamodule.trg_vocab.ids2str
+                trg_str = trg_ids2str(y_true.T.tolist()[0])
+                hyp_str = trg_ids2str(y_hyp.T.tolist()[0])
+                pl._logger.info(f'src: {src_str}')
+                pl._logger.info(f'trg: {trg_str}')
+                pl._logger.info(f'hyp: {hyp_str}')
         return result
 
     def ce_loss(self, output, target):
@@ -126,20 +99,18 @@ class MT(pl.LightningModule):
         epsilon = 0.1
         ignore_index = 0
         reduce = True
-        if target.dim() == lprobs.dim() - 1:
-            target = target.unsqueeze(-1)
+        #calc loss
+        target = target.unsqueeze(-1)
         nll_loss = -lprobs.gather(dim=-1, index=target)
         smooth_loss = -lprobs.sum(dim=-1, keepdim=True)
-        if ignore_index is not None:
-            pad_mask = target.eq(ignore_index)
-            nll_loss.masked_fill_(pad_mask, 0.)
-            smooth_loss.masked_fill_(pad_mask, 0.)
-        else:
-            nll_loss = nll_loss.squeeze(-1)
-            smooth_loss = smooth_loss.squeeze(-1)
-        if reduce:
-            nll_loss = nll_loss.mean()
-            smooth_loss = smooth_loss.mean()
+        #handle ignored index
+        pad_mask = target.eq(ignore_index)
+        nll_loss.masked_fill_(pad_mask, 0.)
+        smooth_loss.masked_fill_(pad_mask, 0.)
+        #handle reduce
+        nll_loss = nll_loss.mean()
+        smooth_loss = smooth_loss.mean()
+
         eps_i = epsilon / lprobs.size(-1)
         loss = (1. - epsilon) * nll_loss + eps_i * smooth_loss
         return loss
@@ -156,9 +127,8 @@ class MT(pl.LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(
             self.parameters(),
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            # weight_decay=1e-4,
+            betas=(0.9, 0.98),
+            eps=1e-9,
         )
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx,
@@ -177,21 +147,21 @@ class MT(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         h = self.hparams
-        X = batch[h.slang]
-        Y = batch[h.tlang][:-1]
-        Y_true = batch[h.tlang][1:]
+        x = batch[h.slang]
+        y = batch[h.tlang][:-1]
+        y_true = batch[h.tlang][1:]
 
-        Y = self(X, Y)
-        loss = self.loss(Y, Y_true)
+        y = self(x,y)
+        loss = self.loss(y, y_true)
         result = pl.EvalResult()
         result.loss = loss
 
-        Y_hyp = self.forward_step(X)
-        src_ids2strs = self.trainer.datamodule.src_ids2strs
-        result.src_str = src_ids2strs(X.T.tolist())
-        trg_ids2strs = self.trainer.datamodule.trg_ids2strs
-        result.trg_str = trg_ids2strs(Y_true.T.tolist())
-        result.hyp_str = trg_ids2strs(Y_hyp.T.tolist())
+        y_hyp = self.search.greedy(x)
+        src_batch2sents = self.trainer.datamodule.src_vocab.batch2sents
+        trg_batch2sents = self.trainer.datamodule.trg_vocab.batch2sents
+        result.src_strs = src_batch2sents(x.T.tolist())
+        result.trg_strs = trg_batch2sents(y_true.T.tolist())
+        result.hyp_strs = trg_batch2sents(y_hyp.T.tolist())
         return result
 
     def validation_epoch_end(self, outputs):
@@ -242,7 +212,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=4096)
     hparams = parser.parse_args()
 
-    dataset = Dataset(train_path=hparams.train_path,
+    dataset = data.Dataset(train_path=hparams.train_path,
                       val_path=hparams.val_path,
                       test_path=hparams.test_path,
                       slang=hparams.slang,
