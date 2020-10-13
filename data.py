@@ -38,7 +38,6 @@ class Vocab:
             self.is_bpe = False
 
     def __len__(self):
-        self.finalize()
         return len(self.vocab)
 
     @staticmethod
@@ -80,7 +79,7 @@ class Vocab:
         self.s2i = {s: i for i, s in enumerate(self.vocab.keys())}
 
     def ids2str(self, ids):
-        strs = [self.i2s[i] for i in ids]
+        strs = [self.i2s.get(i, '<unk>') for i in ids]
         if self.is_bpe:
             strs = self.bpe_decode(strs)
         if self.is_tok:
@@ -92,7 +91,7 @@ class Vocab:
             str = self.tok(str)
         if self.is_bpe:
             str = ' '.join(self.bpe_encode(str))
-        return [self.s2i[s] for s in str.split()]
+        return [self.s2i.get(s, 1) for s in str.split()]
 
     def pad_ids(self, ids, to, bos=True, eos=True):
         if bos:
@@ -147,9 +146,11 @@ class Vocab:
     def idss2batch(self, idss):
         max_len = max(len(ids) for ids in idss)
         batch = [self.pad_ids(ids, max_len) for ids in idss]
+        batch = torch.tensor(batch).T
         return batch
 
     def batch2idss(self, batch):
+        batch = batch.T.tolist()
         idss = [self.unpad_ids(ids) for ids in batch]
         return idss
 
@@ -181,20 +182,34 @@ class Dataset(pl.LightningDataModule):
         return df
 
     def str2ids(self, df):
-        tqdm.pandas(leave=False)
+        tqdm.pandas(leave=True, desc='str2ids')
         slang = self.src_vocab.lang
         tlang = self.trg_vocab.lang
         df[slang] = df[slang].str.split()
         df[tlang] = df[tlang].str.split()
         df[slang] = df[slang].progress_map(
-            lambda l: [self.src_vocab.s2i.get(s, s) for s in l])
+            lambda l: [self.src_vocab.s2i.get(s, 1) for s in l])
         df[tlang] = df[tlang].progress_map(
-            lambda l: [self.trg_vocab.s2i.get(s, s) for s in l])
+            lambda l: [self.trg_vocab.s2i.get(s, 1) for s in l])
         return df
+
+    def proc_df(self, df):
+        slang = self.src_vocab.lang
+        tlang = self.trg_vocab.lang
+
+        tqdm.pandas(leave=True, desc='calc len')
+        df[f'{slang}_len'] = df[slang].progress_map(len)
+        df[f'{tlang}_len'] = df[tlang].progress_map(len)
+        df['ratio'] = df[f'{slang}_len'] / df[f'{tlang}_len']
+        df['ratio'] = df['ratio'].progress_map(lambda x: x if x > 1 else 1 / x)
+
+        df = df[df['ratio'] < 3]
+        return df[[slang, tlang]]
 
     def build_datasets(self, src, trg, out):
         df = self.read_df(src, trg)
         df = self.str2ids(df)
+        df = self.proc_df(df)
         df.to_pickle(out)
 
     def setup(self, stage=None):
@@ -225,19 +240,18 @@ class Dataset(pl.LightningDataModule):
         return batch_ids
 
     def collate_fn(self, batch):
-        if isinstance(batch, dict):
-            batch = [batch]
         slang = self.src_vocab.lang
         tlang = self.trg_vocab.lang
-        keys = list(batch[0].keys())
-        batch = {k: [d[k] for d in batch] for k in keys}
+        batch = {
+            slang: [d[slang] for d in batch],
+            tlang: [d[tlang] for d in batch]
+        }
         batch[slang] = self.src_vocab.idss2batch(batch[slang])
-        batch[slang] = torch.tensor(batch[slang]).T
         batch[tlang] = self.trg_vocab.idss2batch(batch[tlang])
-        batch[tlang] = torch.tensor(batch[tlang]).T
         return batch
 
     def train_dataloader(self):
+        self.train_df = self.train_df.sample(frac=1)
         data = self.train_df.to_dict('records')
         batch_ids = self.batch_ids(data, self.batch_size)
         dataloader = torch.utils.data.DataLoader(
@@ -265,7 +279,7 @@ class Dataset(pl.LightningDataModule):
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
-            num_workers=8,
+            # num_workers=8,
             collate_fn=self.collate_fn,
         )
         return dataloader
@@ -286,38 +300,42 @@ class Dataset(pl.LightningDataModule):
 
 
 if __name__ == "__main__":
-    src_vocab = Vocab(lang='en',
-                      tok='moses',
-                      bpe='./data/wmt14.en-de/bpe.37k.share')
-    src_vocab.read_vocab('./data/wmt14.en-de/vocab.share')
-    print(src_vocab.tok('hello world.'))
-    print(src_vocab.detok(['hello', 'world', '.']))
-    print(src_vocab.bpe_encode('hello world.'))
-    print(src_vocab.bpe_decode(['▁he', 'llo', '▁world', '.']))
-    print(src_vocab.str2ids('hello world.'))
-    print(src_vocab.ids2str([58, 13592, 136, 50]))
-    print(src_vocab.sents2batch(['hello world.', 'hello, you world.']))
-    print(
-        src_vocab.batch2sents([[2, 58, 13592, 136, 50, 3, 0, 0],
-                               [2, 58, 13592, 16, 142, 136, 50, 3]]))
-    trg_vocab = Vocab(lang='de',
-                      tok='moses',
-                      bpe='./data/wmt14.en-de/bpe.37k.share')
-    trg_vocab.read_vocab('./data/wmt14.en-de/vocab.share')
+    en_vocab = Vocab('en', tok='moses', bpe='data/bpe.37k.share')
+    de_vocab = Vocab('de', tok='moses', bpe='data/bpe.37k.share')
 
-    dataset = Dataset(src_vocab, trg_vocab, './data/wmt14.en-de/train.pkl.gz',
-                      './data/wmt14.en-de/val.pkl.gz',
-                      './data/wmt14.en-de/test.pkl.gz', 2500)
-    # dataset.build_datasets('./data/wmt14.en-de/train.en.bpe',
-    #                        './data/wmt14.en-de/train.de.bpe',
-    #                        './data/wmt14.en-de/train.pkl.gz')
-    # dataset.build_datasets('./data/wmt14.en-de/val.en.bpe',
-    #                        './data/wmt14.en-de/val.de.bpe',
-    #                        './data/wmt14.en-de/val.pkl.gz')
-    # dataset.build_datasets('./data/wmt14.en-de/test.en.bpe',
-    #                        './data/wmt14.en-de/test.de.bpe',
-    #                        './data/wmt14.en-de/test.pkl.gz')
+    # en_vocab.read_text('data/train.en')
+    # de_vocab.read_text('data/train.de')
+
+    # en_vocab.finalize('data/share.vocab.en')
+    # de_vocab.finalize('data/share.vocab.de')
+
+    en_vocab.read_vocab('data/share.vocab.en')
+    de_vocab.read_vocab('data/share.vocab.de')
+
+    dataset = Dataset(
+        en_vocab, de_vocab,
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-ende.pkl.gz',
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-ende.pkl.gz',
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-ende.pkl.gz',
+        4096)
+
+    dataset.build_datasets(
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-deen-src.en.subword',
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-deen-ref.de.subword',
+        '/storage07/user_data/zhanglongtu01/minNMT/data/test-full/newstest2014-ende.pkl.gz'
+    )
+    # dataset.build_datasets('data/newstest2013.en', 'data/newstest2013.de',
+    #                        'data/val.pkl.gz')
+    # dataset.build_datasets('data/newstest2014.en', 'data/newstest2014.de',
+    #                        'data/test.pkl.gz')
+
     dataset.setup()
-    for b in dataset.train_dataloader():
-        assert b['en'].numel() <= 2500
-        assert b['de'].numel() <= 2500
+    for b in tqdm(dataset.train_dataloader()):
+        assert b['en'].numel() <= 4096
+        assert b['de'].numel() <= 4096
+    for b in tqdm(dataset.val_dataloader()):
+        assert b['en'].numel() <= 4096
+        assert b['de'].numel() <= 4096
+    for b in tqdm(dataset.test_dataloader()):
+        assert b['en'].numel() <= 4096
+        assert b['de'].numel() <= 4096

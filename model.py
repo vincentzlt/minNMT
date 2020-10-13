@@ -199,9 +199,9 @@ class MyTransformer(nn.Module):
         y = self.proj(y)
         return y
 
-    def forward_step(self, y_step, state=None):
+    def forward_step(self, y_step, state):
         x, y_prev = state
-        Y_prev = y = torch.cat([y_prev, y_step])
+        y_prev = y = torch.cat([y_prev, y_step])
 
         y = self.emb(y)
         y = self.tf.decoder(y, x)
