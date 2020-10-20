@@ -1,4 +1,5 @@
 import pytorch_lightning as pl
+import sacrebleu
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -19,13 +20,13 @@ class MT(pl.LightningModule):
         h = self.hparams = hparams
         if h.model == 'my_transformer':
             self.model = model.MyTransformer(h.dim, h.vocab_size, h.dropout)
-        elif h.model == 'my_transformer':
+        elif h.model == 'pytorch_transformer':
             self.model = model.PytorchTransformer(h.dim, h.vocab_size,
                                                   h.dropout)
         else:
             raise ValueError('model not defined.')
 
-        self.search = search.Search(self.model)
+        self.search = search.Search(self.model, h.lenpen)
         self.lr = 0
 
     @staticmethod
@@ -38,13 +39,15 @@ class MT(pl.LightningModule):
         parser.add_argument('--vocab_size', type=int, default=37000)
         parser.add_argument('--dim', type=int, default=512)
         parser.add_argument('--dropout', type=float, default=0.1)
-        parser.add_argument('--lr_scale', type=float, default=1)
         parser.add_argument('--warmup', type=int, default=4000)
         parser.add_argument(
             '--loss',
             type=str,
             default='label_smooth',
             choices=['ce', 'label_smooth', 'label_smoothed_nll_loss'])
+        parser.add_argument('--lenpen', type=float, default=0.6)
+        parser.add_argument('--beam_size', type=int, default=5)
+        parser.add_argument('--ckpt_save_interval', type=int, default=1500)
         return parser
 
     def forward(self, x, y):
@@ -52,33 +55,24 @@ class MT(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         h = self.hparams
-        x = batch[h.slang]
-        y = batch[h.tlang][:-1]
-        y_true = batch[h.tlang][1:]
+        x = batch[h.src_lang]
+        y = batch[h.trg_lang][:-1]
+        y_true = batch[h.trg_lang][1:]
 
         y = self(x, y)
         loss = self.loss(y, y_true)
-        self.log('train/loss', loss)
-        self.log('train/lr', self.lr, prog_bar=True)
+        self.log('train/loss', loss, on_step=True, prog_bar=False, logger=True)
+        self.log('train/lr', self.lr, on_step=True, prog_bar=True, logger=True)
 
-        if batch_idx % (100 * h.accumulate_grad_batches) == 0:
+        if batch_idx % (2 * h.accumulate_grad_batches) == 0:
             mask = y_true.ne(0)
             y_hyp = y.max(-1)[1]
-            acc = ACC(y_hyp.masked_select(mask), y_true.masked_select(mask))
-            self.log('train/acc', acc, prog_bar=True)
 
-            if batch_idx % (1000 * h.accumulate_grad_batches) == 0:
-                src_vocab = self.trainer.datamodule.src_vocab
-                src_str = src_vocab.ids2str(
-                    src_vocab.unpad_ids(x.T.tolist()[0]))
-                trg_vocab = self.trainer.datamodule.trg_vocab
-                trg_str = trg_vocab.ids2str(
-                    trg_vocab.unpad_ids(y_true.T.tolist()[0]))
-                hyp_str = trg_vocab.ids2str(
-                    trg_vocab.unpad_ids(y_hyp.T.tolist()[0]))
-                self.print(f'src: {src_str}')
-                self.print(f'trg: {trg_str}')
-                self.print(f'hyp: {hyp_str}')
+            pred = y_hyp.masked_select(mask)
+            truth = y_true.masked_select(mask)
+            acc = ACC(pred, truth)
+            self.log('train/acc', acc.item(), prog_bar=True, logger=True)
+
         return loss
 
     def ce_loss(self, output, target):
@@ -140,7 +134,6 @@ class MT(pl.LightningModule):
         dim = h.dim
         step = self.trainer.global_step + 1
         lr = dim**(-0.5) * min(step**(-0.5), step * h.warmup**(-1.5))
-        lr = lr * h.lr_scale
         for pg in optimizer.param_groups:
             pg['lr'] = lr
         self.lr = lr
@@ -155,86 +148,85 @@ class MT(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         h = self.hparams
-        x = batch[h.slang]
-        y = batch[h.tlang][:-1]
-        y_true = batch[h.tlang][1:]
+        x = batch[h.src_lang]
+        y = batch[h.trg_lang][:-1]
+        y_true = batch[h.trg_lang][1:]
 
         y = self(x, y)
         loss = self.loss(y, y_true)
 
-        y_hyp = self.search.greedy(x)
-        src_batch2sents = self.trainer.datamodule.src_vocab.batch2sents
-        trg_batch2sents = self.trainer.datamodule.trg_vocab.batch2sents
-        src_strs = src_batch2sents(x)
-        trg_strs = trg_batch2sents(y_true)
-        hyp_strs = trg_batch2sents(y_hyp)
-        return {
-            'loss': loss,
-            'src_strs': src_strs,
-            'trg_strs': trg_strs,
-            'hyp_strs': hyp_strs,
-        }
+        mask = y_true.ne(0)
+        y_hyp = y.max(-1)[1]
+
+        pred = y_hyp.masked_select(mask)
+        truth = y_true.masked_select(mask)
+        acc = ACC(pred, truth)
+
+        # y_hyp = self.search.topk(x, int(x.size(0) * 2), 4)
+        # unpad = self.trainer.datamodule.unpad
+        return {'loss': loss, 'acc': acc}
 
     def validation_epoch_end(self, outputs):
         loss = torch.stack([o['loss'] for o in outputs]).mean()
+        acc = torch.stack([o['acc'] for o in outputs]).mean()
         self.log('val/loss', loss.item(), prog_bar=True)
+        self.log('val/acc', acc.item(), prog_bar=True)
 
-        src_str = [s for o in outputs for s in o['src_strs']]
-        trg_str = [s for o in outputs for s in o['trg_strs']]
-        hyp_str = [s for o in outputs for s in o['hyp_strs']]
-        self.save_str(src_str, 'src')
-        self.save_str(trg_str, 'trg')
-        self.save_str(hyp_str, f'hyp.{self.trainer.global_step}')
-        bleu = sb.corpus_bleu(hyp_str, [trg_str]).score
-        self.log('val/bleu', bleu, prog_bar=True)
-
-    def save_str(self, strs, fname):
-        d = f'{self.trainer.logger.log_dir}/translations'
+    def save_idss(self, idss, fname):
+        d = f'{self.trainer.logger.log_dir}/hyps'
         if not os.path.exists(d):
             os.makedirs(d, exist_ok=True)
         with open(f'{d}/{fname}', 'wt') as f:
-            f.write('\n'.join(strs))
+            f.write('\n'.join(
+                [' '.join([str(id) for id in ids]) for ids in idss]))
+
+    def test_step(self, batch, batch_idx):
+        x = batch[self.hparams.src_lang]
+        y_hyp = self.search.topk(
+            x,
+            int(x.size(0) * 2),
+            self.hparams.beam_size,
+        )
+        unpad = self.trainer.datamodule.unpad
+        idss = unpad(y_hyp)
+        for ids in idss:
+            print(' '.join([str(i) for i in ids]))
 
 
 if __name__ == "__main__":
     parser = ap.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
     parser = MT.add_model_specific_args(parser)
-    parser.add_argument('--train_path', type=str, default='data/train.pkl.gz')
-    parser.add_argument('--val_path', type=str, default='data/val.pkl.gz')
-    parser.add_argument('--test_path', type=str, default='data/test.pkl.gz')
-    parser.add_argument('--src_vocab_path',
-                        type=str,
-                        default='data/share.vocab.en')
-    parser.add_argument('--trg_vocab_path',
-                        type=str,
-                        default='data/share.vocab.de')
-    parser.add_argument('--slang', type=str, default='en')
-    parser.add_argument('--tlang', type=str, default='de')
-    parser.add_argument('--is_moses', action='store_true', default=True)
-    parser.add_argument('--bpe', type=str, default='data/bpe.37k.share')
+    parser.add_argument('--src_lang')
+    parser.add_argument('--trg_lang')
+    parser.add_argument('--src_train')
+    parser.add_argument('--trg_train')
+    parser.add_argument('--src_val')
+    parser.add_argument('--trg_val')
+    parser.add_argument('--src_test')
+    parser.add_argument('--trg_test')
     parser.add_argument('--batch_size', type=int, default=4096)
+    parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--seed', type=int, default=12345)
-    parser.add_argument('--ckpt_save_interval', type=int, default=1500)
     hparams = parser.parse_args()
 
     pl.seed_everything(hparams.seed)
-    src_vocab = data.Vocab(hparams.slang, 'moses', hparams.bpe)
-    src_vocab.read_vocab(hparams.src_vocab_path)
-    trg_vocab = data.Vocab(hparams.tlang, 'moses', hparams.bpe)
-    trg_vocab.read_vocab(hparams.trg_vocab_path)
 
-    dataset = data.Dataset(src_vocab,
-                           trg_vocab,
-                           train_path=hparams.train_path,
-                           val_path=hparams.val_path,
-                           test_path=hparams.test_path,
-                           batch_size=hparams.batch_size)
+    dataset = data.Dataset(src_lang=hparams.src_lang,
+                           trg_lang=hparams.trg_lang,
+                           src_train=hparams.src_train,
+                           trg_train=hparams.trg_train,
+                           src_val=hparams.src_val,
+                           trg_val=hparams.trg_val,
+                           src_test=hparams.src_test,
+                           trg_test=hparams.trg_test,
+                           batch_size=hparams.batch_size,
+                           num_workers=hparams.num_workers)
     mt = MT(hparams)
     pl._logger.info(mt)
     trainer = pl.Trainer.from_argparse_args(
         hparams,
-        row_log_interval=1,
+        log_every_n_steps=1,
         replace_sampler_ddp=False,
     )
     trainer.fit(mt, dataset)

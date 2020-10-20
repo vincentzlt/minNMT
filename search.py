@@ -1,15 +1,19 @@
+from pytorch_lightning import Trainer
 import torch
 import model
-import sacrebleu as sb
+import sys
+import mt
+import data
+import git
+import argparse as ap
 from tqdm import tqdm
-import utils
 
 
 class Node:
     def __init__(self, score, index, state, prev=None, next=None):
         self.score = score.clone().detach()
         self.index = index.clone().detach()
-        self.state = (s.clone().detach() for s in state)
+        self.state = (s for s in state)
         self.prev = prev
         if next is None:
             self.next = []
@@ -68,19 +72,6 @@ class Search:
 
         self.lenpen = lenpen
 
-    def average_models(self, models):
-        state_dicts = [m.state_dict() for m in models]
-        assert all(
-            list(d.keys()) == list(state_dicts[0].keys()) for d in state_dicts)
-
-        new_state_dict = dict()
-        for k in state_dicts[0].keys():
-            value = torch.stack([d[k] for d in state_dicts]).mean(0)
-            new_state_dict[k] = value
-
-        models[0].load_state_dict(new_state_dict)
-        return models[0]
-
     def greedy(self, x, max_len=None):
         if max_len is None:
             max_len = int(x.size(0) * 1.1)
@@ -97,10 +88,12 @@ class Search:
 
     def topk(self, x, max_len=100, k=1):
         beams, finished = self.init_beams(x, k)
-        for i in range(max_len):
-            beams, finished = self.beam_search(beams, finished)
-            if len([n for beam in beams for n in beam]) == 0:
-                break
+        with tqdm(range(max_len), leave=False) as t:
+            for i in t:
+                beams, finished = self.beam_search(beams, finished)
+                t.set_postfix({'alive': len([n for b in beams for n in b])})
+                if len([n for beam in beams for n in beam]) == 0:
+                    break
         hyp = self.beam_finalize(beams, finished)
         return hyp
 
@@ -198,40 +191,51 @@ class Search:
 
 
 if __name__ == "__main__":
-    import train
-    import data
-    fnames = [
-        '/storage07/user_data/zhanglongtu01/minNMT/exp/run_3/lightning_logs/version_0/checkpoints/step.100500.ckpt',
-    ]
-    ms = [train.MT.load_from_checkpoint(f).model for f in fnames]
-    s = Search(ms, lenpen=0.6)
-    s.model.cuda().eval()
+    parser = ap.ArgumentParser()
+    parser.add_argument(
+        '--input',
+        type=str,
+        default=
+        '/storage07/user_data/zhanglongtu01/minNMT/data/wmt14.en-de.stanford/newstest2014.en.tok.id'
+    )
+    parser.add_argument(
+        '--ckpt',
+        type=str,
+        default=
+        '/storage07/user_data/zhanglongtu01/minNMT/exp/run_8/lightning_logs/version_0/checkpoints/step.109500.ckpt'
+    )
+    parser.add_argument('--gpu', type=int, default=2)
+    parser.add_argument('--batch_size', type=int, default=25000)
+    parser.add_argument('--beam_size', type=int, default=4)
+    parser.add_argument('--lenpen', type=float, default=0.6)
+    args = parser.parse_args()
 
-    en_vocab = data.Vocab('en', tok='moses', bpe='data/bpe.37k.share')
-    de_vocab = data.Vocab('de', tok='moses', bpe='data/bpe.37k.share')
-    en_vocab.read_vocab('data/share.vocab.en')
-    de_vocab.read_vocab('data/share.vocab.de')
-    dataset = data.Dataset(en_vocab, de_vocab, 'data/test.pkl.gz',
-                           'data/val.pkl.gz', 'data/test.pkl.gz', 4096)
+    repo = git.Repo(search_parent_directories=True)
+    sha = repo.head.object.hexsha
+    print('commit #: ', sha, file=sys.stderr)
+
+    mt_model = mt.MT.load_from_checkpoint(args.ckpt)
+    mt_model.hparams.beam_size = args.beam_size
+    mt_model.hparams.lenpen = args.lenpen
+    mt_model.search = Search(mt_model.model, args.lenpen)
+    mt_model = mt_model.cuda(args.gpu).eval()
+
+    dataset = data.Dataset('en', 'de', args.input, args.input, args.input,
+                           args.input, args.input, args.input, args.batch_size,
+                           4)
     dataset.setup()
-    src_sents = []
-    trg_sents = []
-    greedy_sents = []
-    top4_sents = []
-    for b in tqdm(dataset.test_dataloader()):
-        x = b['en'].cuda()
-        y = b['de'].cuda()
-        src = en_vocab.batch2sents(x)
-        src_sents.extend(src)
-        trg = de_vocab.batch2sents(y)
-        trg_sents.extend(trg)
+    # trainer = Trainer(gpus=args.gpus)
+    # hyp_idss = trainer.test(mt_model, datamodule=dataset, verbose=False)
+    # for l in hyp_idss:
+    #     print(' '.join([str(i) for i in l]))
 
-        greedy_hyp = s.greedy(x, 500)
-        greedy_hyp = de_vocab.batch2sents(greedy_hyp)
-        greedy_sents.extend(greedy_hyp)
-        top4_hyp = s.topk(x, 500, 4)
-        top4_hyp = de_vocab.batch2sents(top4_hyp)
-        top4_sents.extend(top4_hyp)
-    print('greedy bleu:', sb.corpus_bleu(greedy_sents, [trg_sents]).score)
-    print('top4 bleu', sb.corpus_bleu(top4_sents, [trg_sents]).score)
-    print()
+    for batch in tqdm(dataset.test_dataloader()):
+        x = batch[mt_model.hparams.src_lang].cuda(args.gpu)
+        y_hyp = mt_model.search.topk(
+            x,
+            int(x.size(0) * 2),
+            args.beam_size,
+        )
+        idss = dataset.unpad(y_hyp)
+        for ids in idss:
+            print(' '.join([str(i) for i in ids]))

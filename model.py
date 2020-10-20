@@ -187,8 +187,8 @@ class MyTransformer(nn.Module):
     def __init__(self, dim, vocab_size, dropout=0.1):
         super().__init__()
 
-        self.emb = Embedding(vocab_size, dim, dropout=0.1)
-        self.tf = Transformer(dim)
+        self.emb = Embedding(vocab_size, dim, dropout=dropout)
+        self.tf = Transformer(dim, dropout=dropout)
         self.proj = nn.Linear(dim, vocab_size, bias=False)
         self.proj.weight = self.emb.emb.weight
 
@@ -222,13 +222,13 @@ class PytorchTransformer(nn.Module):
     def __init__(self, dim, vocab_size, dropout=0.1):
         super().__init__()
 
-        self.emb = Embedding(vocab_size, dim, dropout=0.1)
-        self.tf = nn.Transformer(dim)
+        self.emb = Embedding(vocab_size, dim, dropout=dropout)
+        self.tf = nn.Transformer(dim, dropout=dropout)
         self.proj = nn.Linear(dim, vocab_size, bias=False)
         self.proj.weight = self.emb.emb.weight
 
     def mask(self, x):
-        return self.nn.generate_square_subsequent_mask(x.size(0)).type_as(x)
+        return self.tf.generate_square_subsequent_mask(x.size(0)).type_as(x)
 
     def forward(self, x, y):
         x = self.emb(x)
@@ -239,7 +239,7 @@ class PytorchTransformer(nn.Module):
 
     def forward_step(self, y_step, state=None):
         x, y_prev = state
-        Y_prev = y = torch.cat([y_prev, y_step])
+        y_prev = y = torch.cat([y_prev, y_step])
 
         y = self.emb(y)
         y = self.tf.decoder(y, x, tgt_mask=self.mask(y))
@@ -250,7 +250,7 @@ class PytorchTransformer(nn.Module):
 
     def init_state(self, x):
         y_bos = x[:1]
-        x = self.src_emb(x)
+        x = self.emb(x)
         x = self.tf.encoder(x)
         state = (x, y_bos)
         return state
