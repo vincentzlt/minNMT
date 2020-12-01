@@ -1,0 +1,19 @@
+authorName: default
+experimentName: minNMT-batch_size
+trialConcurrency: 4
+maxExecDuration: 100h
+maxTrialNum: 10
+trainingServicePlatform: local
+# 搜索空间文件
+searchSpacePath: /home/longtu/minNMT/scripts/search_space.json
+useAnnotation: false
+logDir: /home/longtu/minNMT/scripts/.nni
+tuner:
+  builtinTunerName: TPE
+  classArgs:
+    optimize_mode: maximize
+# 运行的命令，以及 Trial 代码的路径
+trial:
+  command: bash /home/longtu/minNMT/scripts/train.sh
+  codeDir: /home/longtu/minNMT/
+  gpuNum: 1

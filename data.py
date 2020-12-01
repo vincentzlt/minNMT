@@ -1,34 +1,29 @@
 import pytorch_lightning as pl
 import torch
 import pandas as pd
-import collections as cl
-import functools as ft
+from tqdm import tqdm
+from utils.id2df import read_int
 
 
 class Dataset(pl.LightningDataModule):
-    def __init__(self,
-                 src_lang,
-                 trg_lang,
-                 src_train,
-                 trg_train,
-                 src_val,
-                 trg_val,
-                 src_test,
-                 trg_test,
-                 bpe_file=None,
-                 batch_size=4096,
-                 num_workers=8):
+    def __init__(
+        self,
+        src_lang,
+        trg_lang,
+        train_pkl=None,  # path to df
+        val_pkl=None,  # path to df
+        test_src=None,  # path to txt
+        test_trg=None,  # path to txt
+        batch_size=2500,
+        num_workers=4):
         super().__init__()
 
         self.src_lang = src_lang
         self.trg_lang = trg_lang
-        self.src_train = src_train
-        self.trg_train = trg_train
-        self.src_val = src_val
-        self.trg_val = trg_val
-        self.src_test = src_test
-        self.trg_test = trg_test
-        self.bpe_file = bpe_file
+        self.train_pkl = train_pkl
+        self.val_pkl = val_pkl
+        self.test_src = test_src
+        self.test_trg = test_trg
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -36,18 +31,15 @@ class Dataset(pl.LightningDataModule):
     def prepare_data(self) -> None:
         pass
 
-    def read_df(self, src, trg):
-        df = pd.DataFrame({
-            self.src_lang: open(src).read().strip().split('\n'),
-            self.trg_lang: open(trg).read().strip().split('\n')
-        })
-        df = df.applymap(lambda s: [int(id) for id in s.split()])
-        return df
-
     def setup(self, stage=None):
-        self.train_df = self.read_df(self.src_train, self.trg_train)
-        self.val_df = self.read_df(self.src_val, self.trg_val)
-        self.test_df = self.read_df(self.src_test, self.trg_test)
+        if stage == 'fit' and self.train_pkl is not None and self.val_pkl is not None:
+            self.train_df = pd.read_pickle(self.train_pkl)
+            self.val_df = pd.read_pickle(self.val_pkl)
+        if stage == 'test' and self.test_src is not None and self.test_trg is not None:
+            self.test_df = pd.DataFrame({
+                self.src_lang: read_int(self.test_src),
+                self.trg_lang: read_int(self.test_trg)
+            })
 
     def batch_ids(self, data, size):
         slen = [len(d[self.src_lang]) for d in data]
@@ -57,14 +49,14 @@ class Dataset(pl.LightningDataModule):
         batch_id = []
         batch_slen = []
         batch_tlen = []
-        mlen = 0
         for i, (sl, tl) in enumerate(zip(slen, tlen)):
             assert sl <= size and tl <= size
             batch_slen.append(sl)
             batch_tlen.append(tl)
             batch_id.append(i)
-            if len(batch_id) * max(batch_slen) > size or len(batch_id) * max(
-                    batch_tlen) > size:
+            src_size = len(batch_id) * max(batch_slen)
+            trg_size = len(batch_id) * max(batch_tlen)
+            if src_size > size or trg_size > size:
                 batch_ids.append(batch_id[:-1])
                 batch_slen = batch_slen[-1:]
                 batch_tlen = batch_tlen[-1:]
@@ -72,12 +64,14 @@ class Dataset(pl.LightningDataModule):
         batch_ids.append(batch_id)
         return batch_ids
 
-    def pad(self, batch):
+    @staticmethod
+    def pad(batch):
         maxlen = max(len(b) for b in batch)
         batch = [b + [0] * (maxlen - len(b)) for b in batch]
         return torch.tensor(batch).T
 
-    def unpad(self, batch):
+    @staticmethod
+    def unpad(batch):
         batch = batch.T.tolist()
         batch = [l[1:] if l[0] == 2 else l for l in batch]
         batch = [l[:l.index(3)] if 3 in l else l for l in batch]
@@ -95,8 +89,7 @@ class Dataset(pl.LightningDataModule):
         return batch
 
     def train_dataloader(self):
-        self.train_df = self.train_df.sample(frac=1)
-        data = self.train_df.to_dict('records')
+        data = self.train_df.sample(frac=1).to_dict('records')
         batch_ids = self.batch_ids(data, self.batch_size)
         dataloader = torch.utils.data.DataLoader(
             data,
@@ -108,7 +101,7 @@ class Dataset(pl.LightningDataModule):
 
     def val_dataloader(self):
         data = self.val_df.to_dict('records')
-        batch_ids = self.batch_ids(data, self.batch_size // 4)
+        batch_ids = self.batch_ids(data, self.batch_size)
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
@@ -123,7 +116,28 @@ class Dataset(pl.LightningDataModule):
         dataloader = torch.utils.data.DataLoader(
             data,
             batch_sampler=batch_ids,
-            # num_workers=self.num_workers,
+            num_workers=self.num_workers,
             collate_fn=self.collate_fn,
         )
         return dataloader
+
+
+if __name__ == "__main__":
+    dataset = Dataset('en', 'de', 'data/wmt14.en-de/train.pkl',
+                      'data/wmt14.en-de/val.pkl',
+                      'data/wmt14.en-de/test.en.id',
+                      'data/wmt14.en-de/test.de.id', 20000, 2)
+    print('setup dataset ...')
+    dataset.setup('fit')
+    print('setup dataloaders ...')
+    for b in tqdm(dataset.train_dataloader()):
+        assert b['en'].numel() <= 20000
+        assert b['de'].numel() <= 20000
+    for b in tqdm(dataset.val_dataloader()):
+        assert b['en'].numel() <= 20000
+        assert b['de'].numel() <= 20000
+    dataset.setup('test')
+    for b in tqdm(dataset.test_dataloader()):
+        assert b['en'].numel() <= 20000
+        assert b['de'].numel() <= 20000
+    print()

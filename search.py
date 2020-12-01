@@ -2,7 +2,7 @@ from pytorch_lightning import Trainer
 import torch
 import model
 import sys
-import mt
+from train import MT
 import data
 import git
 import argparse as ap
@@ -60,7 +60,7 @@ class Node:
 
 
 class Search:
-    def __init__(self, model=model.MyTransformer, lenpen=0):
+    def __init__(self, model=model.Transformer(), lenpen=0):
         if isinstance(model, torch.nn.Module):
             self.model = model
         elif isinstance(model, list) and all(
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     sha = repo.head.object.hexsha
     print('commit #: ', sha, file=sys.stderr)
 
-    mt_model = mt.MT.load_from_checkpoint(args.ckpt)
+    mt_model = MT.load_from_checkpoint(args.ckpt)
     mt_model.hparams.beam_size = args.beam_size
     mt_model.hparams.lenpen = args.lenpen
     mt_model.search = Search(mt_model.model, args.lenpen)
