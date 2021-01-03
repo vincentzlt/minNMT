@@ -161,38 +161,41 @@ class Dataset:
         t = self.trg_tok.lang
         d = self.data_dir
 
-        if os.path.exists(f'{d}/train.pkl'):
-            self.train_df = pd.read_pickle(f'{d}/train.pkl')
-        else:
-            self.train_df = pd.DataFrame({
-                s:
-                open(f'{d}/train.{s}.id').read().strip().split('\n'),
-                t:
-                open(f'{d}/train.{t}.id').read().strip().split('\n')
-            }).applymap(lambda s: list(map(int, s.split())))
-            self.train_df.to_pickle(f'{d}/train.pkl')
+        if not hasattr(self, "train_df"):
+            if os.path.exists(f'{d}/train.pkl'):
+                self.train_df = pd.read_pickle(f'{d}/train.pkl')
+            else:
+                self.train_df = pd.DataFrame({
+                    s:
+                    open(f'{d}/train.{s}.id').read().strip().split('\n'),
+                    t:
+                    open(f'{d}/train.{t}.id').read().strip().split('\n')
+                }).applymap(lambda s: list(map(int, s.split())))
+                self.train_df.to_pickle(f'{d}/train.pkl')
 
-        if os.path.exists(f'{d}/val.pkl'):
-            self.val_df = pd.read_pickle(f'{d}/val.pkl')
-        else:
-            self.val_df = pd.DataFrame({
-                s:
-                open(f'{d}/val.{s}.id').read().strip().split('\n'),
-                t:
-                open(f'{d}/val.{t}.id').read().strip().split('\n')
-            }).applymap(lambda s: list(map(int, s.split())))
-            self.val_df.to_pickle(f'{d}/val.pkl')
+        if not hasattr(self, "val_df"):
+            if os.path.exists(f'{d}/val.pkl'):
+                self.val_df = pd.read_pickle(f'{d}/val.pkl')
+            else:
+                self.val_df = pd.DataFrame({
+                    s:
+                    open(f'{d}/val.{s}.id').read().strip().split('\n'),
+                    t:
+                    open(f'{d}/val.{t}.id').read().strip().split('\n')
+                }).applymap(lambda s: list(map(int, s.split())))
+                self.val_df.to_pickle(f'{d}/val.pkl')
 
-        if os.path.exists(f'{d}/test.pkl'):
-            self.test_df = pd.read_pickle(f'{d}/test.pkl')
-        else:
-            self.test_df = pd.DataFrame({
-                s:
-                open(f'{d}/test.{s}.id').read().strip().split('\n'),
-                t:
-                open(f'{d}/test.{t}.id').read().strip().split('\n')
-            }).applymap(lambda s: list(map(int, s.split())))
-            self.test_df.to_pickle(f'{d}/test.pkl')
+        if not hasattr(self, "test_df"):
+            if os.path.exists(f'{d}/test.pkl'):
+                self.test_df = pd.read_pickle(f'{d}/test.pkl')
+            else:
+                self.test_df = pd.DataFrame({
+                    s:
+                    open(f'{d}/test.{s}.id').read().strip().split('\n'),
+                    t:
+                    open(f'{d}/test.{t}.id').read().strip().split('\n')
+                }).applymap(lambda s: list(map(int, s.split())))
+                self.test_df.to_pickle(f'{d}/test.pkl')
 
     @staticmethod
     def batch_idxs(dataset, batch_size):

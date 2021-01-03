@@ -45,6 +45,8 @@ class GNMT(nn.Module):
         self.decoder_layers = nn.ModuleList([nn.LSTM(dim, dim)] * 8)
         self.attn = Attn(dim)
 
+        self.optim = torch.optim.Adam(self.parameters())
+
     def forward(self, strs):
         x = Dataset.pad_idss(self.src_tok.batch_encode(strs))
         y_step = x[:1]
@@ -119,13 +121,30 @@ if __name__ == "__main__":
 
     print("prepare model ...")
     gnmt = GNMT(src_tok, trg_tok, 512, 0.1).cuda()
-    print("prepare optimizer ...")
-    optim = torch.optim.Adam(gnmt.parameters())
+
     print('setup dataset ...')
     dataset = Dataset(src_tok, trg_tok,
                       '/pvc/minNMT/data/wmt14.en-de/bpe.37000.h100000')
     dataset.setup()
     print(f'done.')
+
+    tensorboard = SummaryWriter()
+    train_tqdm = tqdm(dataset.train_dataloader(20000))
+    for b in train_tqdm:
+
+        def closure():
+            gnmt.zero_grad()
+            loss, acc = gnmt.train_step(b)
+            loss.backward()
+            train_tqdm.set_postfix({'loss': loss.item(), 'acc': acc.item()})
+            tensorboard.add_scalar('train/loss', loss.item(), train_tqdm.n)
+            tensorboard.add_scalar('train/acc', acc.item(), train_tqdm.n)
+            return loss
+
+        gnmt.optim.step(closure)
+
+    tensorboard.close()
+    train_tqdm.close()
 
     strs = [
         'Gutach: Increased safety for pedestrians',
@@ -154,21 +173,3 @@ if __name__ == "__main__":
         y.append(y_step)
     y = torch.cat(y)
     print()
-
-    # tensorboard = SummaryWriter()
-    # train_tqdm = tqdm(dataset.train_dataloader(20000))
-    # for b in train_tqdm:
-
-    #     def closure():
-    #         gnmt.zero_grad()
-    #         loss, acc = gnmt.train_step(b)
-    #         loss.backward()
-    #         train_tqdm.set_postfix({'loss': loss.item(), 'acc': acc.item()})
-    #         tensorboard.add_scalar('train/loss', loss.item(), train_tqdm.n)
-    #         tensorboard.add_scalar('train/acc', acc.item(), train_tqdm.n)
-    #         return loss
-
-    #     optim.step(closure)
-
-    # tensorboard.close()
-    # train_tqdm.close()
